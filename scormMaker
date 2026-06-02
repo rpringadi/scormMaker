@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# scormMaker — package a theory page + multiple-choice quiz into a SCORM 1.2 zip
+#
+# Usage:
+#   scormMaker <title> <context.txt> <quiz.txt> [output.zip]
+#
+# Requirements:
+#   - bash 4+
+#   - python3 3.6+ (stdlib only: json, re, html)
+#   - zip (InfoZIP CLI; preinstalled on macOS; `apt install zip` on Debian/Ubuntu)
+#   - mktemp (POSIX, always present)
+#
+# quiz.txt format:
+#   1. Question text?
+#   A. Option one
+#   B. Option two (*)
+#   C. Option three
+#   D. Option four
+#   (blank line between questions)
+#
+# The (*) marks the correct answer. It is stripped before display and kept
+# server-side (in JS, baked into the package) for scoring.
+
+set -euo pipefail
+
+if [ $# -lt 3 ]; then
+  echo "Usage: $0 <title> <context.txt> <quiz.txt> [output.zip]" >&2
+  exit 1
+fi
+
+TITLE="$1"
+CONTEXT_FILE="$2"
+QUIZ_FILE="$3"
+OUT_ZIP="${4:-${TITLE// /_}.zip}"
+PASS_MARK=70
+
+[ -r "$CONTEXT_FILE" ] || { echo "Cannot read $CONTEXT_FILE" >&2; exit 1; }
+[ -r "$QUIZ_FILE" ]    || { echo "Cannot read $QUIZ_FILE"    >&2; exit 1; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# --- Build quiz JSON from quiz.txt -----------------------------------------
+python3 - "$QUIZ_FILE" > "$WORK/quiz.json" <<'PY'
+import json, re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+blocks = re.split(r"\n\s*\n", src.strip())
+out = []
+for b in blocks:
+    lines = [l.rstrip() for l in b.splitlines() if l.strip()]
+    if not lines: continue
+    q = re.sub(r"^\d+\.\s*", "", lines[0])
+    opts, correct = [], None
+    for i, line in enumerate(lines[1:]):
+        m = re.match(r"^([A-D])\.\s*(.*)$", line)
+        if not m: continue
+        letter, text = m.group(1), m.group(2)
+        if "(*)" in text:
+            correct = i
+            text = text.replace("(*)", "").strip()
+        opts.append(text)
+    if correct is None:
+        print(f"WARN: no answer marked for: {q}", file=sys.stderr)
+        correct = 0
+    out.append({"q": q, "options": opts, "correct": correct})
+print(json.dumps(out, ensure_ascii=False))
+PY
+
+QUIZ_JSON="$(cat "$WORK/quiz.json")"
+
+# --- Read theory as paragraphs ---------------------------------------------
+THEORY_HTML="$(python3 - "$CONTEXT_FILE" <<'PY'
+import html, sys
+src = open(sys.argv[1], encoding="utf-8").read().strip()
+paras = [p.strip() for p in src.split("\n\n") if p.strip()]
+print("\n".join(f"<p>{html.escape(p)}</p>" for p in paras))
+PY
+)"
+
+# --- index.html -------------------------------------------------------------
+cat > "$WORK/index.html" <<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${TITLE}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 760px; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; color: #222; }
+  h1 { border-bottom: 2px solid #0f6cbf; padding-bottom: .3rem; }
+  h2 { margin-top: 2rem; }
+  .quiz-q { margin: 1.2rem 0; padding: .8rem 1rem; background: #f7f7f7; border-radius: 6px; }
+  .quiz-q.correct { background: #e6f7e6; }
+  .quiz-q.wrong   { background: #fbe6e6; }
+  .quiz-q label { display: block; padding: .2rem 0; cursor: pointer; }
+  button { background: #0f6cbf; color: #fff; border: 0; padding: .6rem 1.2rem; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+  button:disabled { background: #b0bec5; cursor: not-allowed; }
+  button.secondary { background: #6c757d; }
+  button.primary-action { box-shadow: 0 0 0 3px rgba(15,108,191,.25); }
+  #result { font-size: 1.2rem; padding: 1rem; margin-top: 1rem; border-radius: 6px; }
+  #result.pass { background: #e6f7e6; border-left: 4px solid #2a7a2a; }
+  #result.fail { background: #fbe6e6; border-left: 4px solid #c00; }
+  .feedback { margin-top: .4rem; font-size: .9rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>${TITLE}</h1>
+
+<section id="theory">
+${THEORY_HTML}
+</section>
+
+<h2>Knowledge check</h2>
+<p>Answer all questions and click <strong>Submit</strong>. Passing score: ${PASS_MARK}%.</p>
+
+<form id="quiz"></form>
+<p>
+  <button type="button" id="submitBtn">Submit</button>
+  <button type="button" id="retryBtn" style="display:none">Retake</button>
+  <button type="button" id="exitBtn" style="display:none">Exit activity</button>
+</p>
+<div id="result"></div>
+
+<script>
+const QUIZ = ${QUIZ_JSON};
+const PASS_MARK = ${PASS_MARK};
+const LETTERS = ["A","B","C","D","E","F"];
+
+function renderQuiz() {
+  const form = document.getElementById("quiz");
+  form.innerHTML = "";
+  QUIZ.forEach((q, i) => {
+    const div = document.createElement("div");
+    div.className = "quiz-q";
+    div.id = "q" + i;
+    let html = "<strong>" + (i+1) + ". " + escapeHtml(q.q) + "</strong>";
+    q.options.forEach((opt, j) => {
+      html += '<label><input type="radio" name="q' + i + '" value="' + j + '"> '
+            + LETTERS[j] + ". " + escapeHtml(opt) + "</label>";
+    });
+    div.innerHTML = html;
+    form.appendChild(div);
+  });
+  document.getElementById("result").innerHTML = "";
+  document.getElementById("result").className = "";
+  document.getElementById("retryBtn").style.display = "none";
+  document.getElementById("retryBtn").classList.remove("primary-action");
+  document.getElementById("exitBtn").style.display = "none";
+  const submit = document.getElementById("submitBtn");
+  submit.style.display = "inline-block";
+  submit.disabled = false;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function gradeQuiz() {
+  let correct = 0;
+  QUIZ.forEach((q, i) => {
+    const picked = document.querySelector('input[name="q' + i + '"]:checked');
+    const block = document.getElementById("q" + i);
+    block.classList.remove("correct", "wrong");
+    const old = block.querySelector(".feedback");
+    if (old) old.remove();
+    if (!picked) {
+      block.classList.add("wrong");
+      const fb = document.createElement("div");
+      fb.className = "feedback";
+      fb.textContent = "Not answered.";
+      block.appendChild(fb);
+      return;
+    }
+    const val = parseInt(picked.value, 10);
+    const fb = document.createElement("div");
+    fb.className = "feedback";
+    if (val === q.correct) {
+      correct++;
+      block.classList.add("correct");
+      fb.textContent = "Correct.";
+    } else {
+      block.classList.add("wrong");
+      fb.textContent = "Incorrect.";
+    }
+    block.appendChild(fb);
+  });
+  return { correct, total: QUIZ.length, pct: Math.round(100 * correct / QUIZ.length) };
+}
+
+// --- SCORM 1.2 API wrapper --------------------------------------------------
+function findAPI(win) {
+  let depth = 0;
+  while (win && depth < 10) {
+    if (win.API) return win.API;
+    if (win.parent === win) break;
+    win = win.parent;
+    depth++;
+  }
+  if (window.opener && window.opener.API) return window.opener.API;
+  return null;
+}
+const API = findAPI(window);
+let scormReady = false;
+if (API) {
+  scormReady = API.LMSInitialize("") === "true";
+  if (scormReady) {
+    API.LMSSetValue("cmi.core.lesson_status", "incomplete");
+    API.LMSCommit("");
+  }
+}
+
+function reportScore(pct, passed) {
+  if (!scormReady) return;
+  API.LMSSetValue("cmi.core.score.raw", String(pct));
+  API.LMSSetValue("cmi.core.score.min", "0");
+  API.LMSSetValue("cmi.core.score.max", "100");
+  API.LMSSetValue("cmi.core.lesson_status", passed ? "passed" : "failed");
+  API.LMSCommit("");
+}
+
+window.addEventListener("beforeunload", () => {
+  if (scormReady) { API.LMSCommit(""); API.LMSFinish(""); }
+});
+
+function exitActivity() {
+  if (scormReady) { API.LMSCommit(""); API.LMSFinish(""); scormReady = false; }
+  // Walk up the frame chain looking for the SCORM player page; navigate it
+  // back to its parent course page if we can find it, else fall back to /my/.
+  let w = window, target = null;
+  for (let i = 0; i < 10 && w; i++) {
+    try {
+      const href = w.location.href || "";
+      if (/\/mod\/scorm\/(view|player)\.php/.test(href)) { target = w; break; }
+      if (w.parent === w) break;
+      w = w.parent;
+    } catch (e) { break; }
+  }
+  try {
+    if (target) {
+      // Prefer Moodle's own Exit link if it's on the page (calls LMSFinish + redirects)
+      const exitLink = target.document && target.document.querySelector('a[href*="exitlink"], #exitLink, .exitlink, a[title*="Exit"]');
+      if (exitLink) { exitLink.click(); return; }
+      target.location.href = "/my/";
+    } else {
+      window.top.location.href = "/my/";
+    }
+  } catch (e) {
+    window.location.href = "/my/";
+  }
+}
+
+// --- Wire up ----------------------------------------------------------------
+document.getElementById("submitBtn").addEventListener("click", () => {
+  const r = gradeQuiz();
+  const passed = r.pct >= PASS_MARK;
+  const res = document.getElementById("result");
+  res.className = passed ? "pass" : "fail";
+  res.innerHTML = "Score: <strong>" + r.correct + " / " + r.total
+                + " (" + r.pct + "%)</strong> — "
+                + (passed ? "Passed." : "Below pass mark of " + PASS_MARK + "%.");
+  reportScore(r.pct, passed);
+
+  const submit = document.getElementById("submitBtn");
+  const retry  = document.getElementById("retryBtn");
+  const exit   = document.getElementById("exitBtn");
+
+  if (passed) {
+    submit.style.display = "none";
+    retry.style.display = "none";
+    exit.style.display = "inline-block";
+    exit.classList.add("primary-action");
+  } else {
+    submit.disabled = true;
+    retry.style.display = "inline-block";
+    retry.classList.add("primary-action");
+    exit.style.display = "none";
+  }
+});
+
+document.getElementById("retryBtn").addEventListener("click", renderQuiz);
+document.getElementById("exitBtn").addEventListener("click", exitActivity);
+
+renderQuiz();
+</script>
+</body>
+</html>
+HTML
+
+# --- imsmanifest.xml --------------------------------------------------------
+IDENT="$(echo "$TITLE" | tr ' ' '_' | tr -cd '[:alnum:]_-')"
+cat > "$WORK/imsmanifest.xml" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest identifier="${IDENT}_MANIFEST" version="1.2"
+  xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+  xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_rootv1p2"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.imsproject.org/xsd/imscp_rootv1p1p2 imscp_rootv1p1p2.xsd
+                      http://www.imsglobal.org/xsd/imsmd_rootv1p2p1 imsmd_rootv1p2p1.xsd
+                      http://www.adlnet.org/xsd/adlcp_rootv1p2 adlcp_rootv1p2.xsd">
+  <metadata>
+    <schema>ADL SCORM</schema>
+    <schemaversion>1.2</schemaversion>
+  </metadata>
+  <organizations default="ORG-1">
+    <organization identifier="ORG-1">
+      <title>${TITLE}</title>
+      <item identifier="ITEM-1" identifierref="RES-1">
+        <title>${TITLE}</title>
+        <adlcp:masteryscore>${PASS_MARK}</adlcp:masteryscore>
+      </item>
+    </organization>
+  </organizations>
+  <resources>
+    <resource identifier="RES-1" type="webcontent" adlcp:scormtype="sco" href="index.html">
+      <file href="index.html"/>
+    </resource>
+  </resources>
+</manifest>
+XML
+
+# --- Zip it up --------------------------------------------------------------
+OUT_ABS="$(cd "$(dirname "$OUT_ZIP")" && pwd)/$(basename "$OUT_ZIP")"
+(cd "$WORK" && zip -qr "$OUT_ABS" .)
+
+echo "Built: $OUT_ABS"
+echo "Title: $TITLE"
+echo "Questions: $(echo "$QUIZ_JSON" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
+echo "Pass mark: ${PASS_MARK}%"
